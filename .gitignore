@@ -1,0 +1,7 @@
+# TensorRT 엔진 (GPU/버전 종속 — build_engines.sh 로 생성)
+*.plan
+*.engine
+
+# 파이썬 캐시
+__pycache__/
+*.pyc

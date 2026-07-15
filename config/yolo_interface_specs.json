@@ -1,0 +1,20 @@
+{
+    "input_image": {
+        "width": 640,
+        "height": 640
+    },
+    "camera_resolution": {
+        "width": 640,
+        "height": 480
+    },
+    "camera_frame": "camera_color_optical_frame",
+    "focal_length": {
+        "f_x": 380.0,
+        "f_y": 380.0
+    },
+    "subscribed_topics": {
+        "image": "/yolov8_encoder/resize/image",
+        "camera_info": "/yolov8_encoder/resize/camera_info",
+        "prompt": "/detections_cup"
+    }
+}
