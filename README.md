@@ -1,5 +1,12 @@
 # perception — 컵 6-DOF pose 라이브 인식 (FoundationPose)
 
+## 빠른 시작 (git clone 후)
+```bash
+./bootstrap.sh   # docker+toolkit+호스트설정+git-lfs, OS로 3.2/4.5 자동감지
+```
+호스트별로 3.2(22.04/Ampere)·4.5(24.04/Ampere~Blackwell) 분리 사용. 이후 이미지 단계는 bootstrap 안내/RUN.md.
+
+
 > 🚀 **바로 실행하려면 [RUN.md](RUN.md)** (docker 명령·경로 치트시트).
 
 D435i 영상에서 컵의 6-DOF pose를 추정해 sim2real pour 정책의 라이브 입력
