@@ -63,3 +63,30 @@ docker exec -u admin isaac_ros_dev-x86_64-container bash -lc \
 - 레포가 작게 유지됨(이 레시피는 수 KB). tar 전송(21GB) 불필요.
 - 재료가 전부 공식이라 어느 머신에서든 `git clone` → build 로 재현.
 - 단점: 첫 빌드에 시간(수십 분)과 네트워크 필요. 급하면 tar `docker load` 가 빠름.
+
+---
+
+## Blackwell(RTX 50/PRO 6000) 대응 — 목표: Isaac ROS release-4.5
+
+**배경**: 전 머신이 Blackwell(5080·5090·server 6000)로 가는데, 현재 이미지(Isaac ROS **3.2**,
+Ubuntu 22.04, CUDA 12.x)는 Blackwell(sm_120)을 지원 안 한다. Blackwell 지원은 **release-4.5**부터.
+
+**release-4.5 요구사항** (nvidia-isaac-ros.github.io/getting_started):
+| 항목 | 3.2 (현재) | 4.5 (Blackwell) |
+|---|---|---|
+| CUDA | 12.x | **13.0+** |
+| TensorRT | ~8.x | 10.13 |
+| 드라이버 | — | **580+** (pc5090=580.159 ✅) |
+| OS | 22.04 | **24.04** |
+| ROS | **Humble** | **Jazzy** |
+
+**즉 base 태그 교체가 아니라 major 마이그레이션**:
+- `isaac_ros_common` → release-4.5 브랜치, run_dev.sh 로 CUDA13/Ubuntu24.04 base 빌드.
+- `Dockerfile.perception` 의 `ros-humble-isaac-ros-*` → **`ros-jazzy-isaac-ros-*`** (4.5 버전).
+- launch fragment·FoundationPose 노드 파라미터·**num_classes 패치**를 4.5 API 로 재검증.
+- 엔진(.plan) TensorRT 10.13 으로 재빌드(build_engines.sh, GPU별).
+- 커스텀 rclpy 노드(bbox_depth_mask·pose_overlay·pose_smoother·detection_filter)는 대부분 포팅되나 Jazzy 확인 필요.
+
+**전략**: 4.5/Jazzy 로 레시피를 한 번 맞추면 → 전 Blackwell 머신 동일 이미지 재현(환경별 충돌 최소화).
+**검증**: 5090 이 지금 있으니, 3070→5080 교체 전에 5090 에서 4.5 build+run 을 통과시켜 두면 됨.
+**주의**: 마이그레이션은 미착수. 위 3.2 레시피는 Ampere(3070) 용으로 계속 유효.
