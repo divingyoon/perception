@@ -1,53 +1,38 @@
-# perception 커스텀 레이어 — isaac_ros_common 빌드 체인의 마지막 key.
+# perception 커스텀 레이어 — Isaac ROS CLI 4.5 이미지 체인의 마지막 key.
 #
-# 21GB 커스텀 tar 를 대체한다. base(ros2_humble) + realsense(librealsense 소스빌드,
-# isaac_ros_common 표준 layer) 위에 FoundationPose 파이프라인용 Isaac ROS apt 패키지 +
-# cyclonedds 설정을 얹는다. 재료(base·패키지·librealsense)는 전부 공식 소스라 재현된다.
+# CLI 기본 Jazzy 이미지와 realsense 레이어 위에 FoundationPose 파이프라인용
+# Isaac ROS apt 패키지와 CycloneDDS 설정을 추가한다.
 #
-# image key 로 사용: CONFIG_IMAGE_KEY=ros2_humble.realsense.perception
+# image key 로 사용: CONFIG_IMAGE_KEY=ros2_jazzy.realsense.perception
 # 빌드 절차는 docker/BUILD.md 참조.
 #
-# ⚠️ DRAFT — 첫 `docker build` 는 bring-up. isaac apt repo/패키지 버전에 따라 1~2곳
-#    수정이 필요할 수 있다(BUILD.md 트러블슈팅).
-
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 # --- Isaac ROS 파이프라인 패키지 (isaac apt repo 는 base layer 에 이미 설정됨) -------
 #     의존(gxf-isaac-*, nitros-*-type)은 apt 가 자동 해결.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ros-humble-isaac-ros-examples \
-      ros-humble-isaac-ros-foundationpose \
-      ros-humble-isaac-ros-segment-anything \
-      ros-humble-isaac-ros-yolov8 \
-      ros-humble-isaac-ros-rtdetr \
-      ros-humble-isaac-ros-realsense \
-      ros-humble-isaac-ros-image-proc \
-      ros-humble-isaac-ros-dnn-image-encoder \
-      ros-humble-isaac-ros-tensor-rt \
-      ros-humble-isaac-ros-tensor-proc \
-      ros-humble-isaac-ros-triton \
-      ros-humble-isaac-ros-depth-image-proc \
-      ros-humble-isaac-ros-nitros-topic-tools \
+      ros-jazzy-rmw-cyclonedds-cpp \
+      ros-jazzy-isaac-ros-examples \
+      ros-jazzy-isaac-ros-foundationpose \
+      ros-jazzy-isaac-ros-segment-anything \
+      ros-jazzy-isaac-ros-yolov8 \
+      ros-jazzy-isaac-ros-rtdetr \
+      ros-jazzy-isaac-ros-realsense \
+      ros-jazzy-isaac-ros-image-proc \
+      ros-jazzy-isaac-ros-dnn-image-encoder \
+      ros-jazzy-isaac-ros-tensor-rt \
+      ros-jazzy-isaac-ros-tensor-proc \
+      ros-jazzy-isaac-ros-triton \
+      ros-jazzy-isaac-ros-depth-image-proc \
+      ros-jazzy-isaac-ros-nitros-topic-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # --- cyclonedds 소켓버퍼 설정 (10MB — 대용량 이미지 토픽 전송용) ---------------------
 COPY cyclonedds.xml /etc/perception/cyclonedds.xml
 
-# --- 컨테이너 기본 환경 (run_dev.sh 가 만드는 admin 유저 bashrc) ---------------------
-#     RMW=cyclonedds, DOMAIN_ID=126, ISAAC_ROS_WS. 호스트 net.core.rmem_max 도 필요
-#     (perception/host_setup.sh 가 처리).
-RUN set -eux; \
-    HOME_DIR=/home/admin; \
-    [ -d "$HOME_DIR" ] || HOME_DIR=/root; \
-    cp /etc/perception/cyclonedds.xml "$HOME_DIR/cyclonedds.xml"; \
-    { \
-      echo ''; \
-      echo '# --- perception (FoundationPose 파이프라인) ---'; \
-      echo 'export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp'; \
-      echo 'export CYCLONEDDS_URI=file://$HOME/cyclonedds.xml'; \
-      echo 'export ROS_DOMAIN_ID=126'; \
-      echo 'export ISAAC_ROS_WS=/workspaces/isaac_ros-dev'; \
-      echo 'export PATH="$HOME/.local/bin:$PATH"'; \
-      echo '[ -f ${ISAAC_ROS_WS}/install/setup.bash ] && source ${ISAAC_ROS_WS}/install/setup.bash'; \
-    } >> "$HOME_DIR/.bashrc"
+# --- 컨테이너 기본 환경 -------------------------------------------------------
+ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+    CYCLONEDDS_URI=file:///etc/perception/cyclonedds.xml \
+    ROS_DOMAIN_ID=126 \
+    ISAAC_ROS_WS=/workspaces/isaac_ros-dev

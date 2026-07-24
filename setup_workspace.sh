@@ -2,7 +2,7 @@
 # perception 자산을 Isaac ROS 컨테이너 워크스페이스에 배치한다.
 # git clone 후 1회 실행. perception/ 이 원본, 워크스페이스는 파생(복사본)이다.
 #
-# 호스트에서 실행 (컨테이너 밖). ISAAC_ROS_WS 는 run_dev.sh 가 마운트하는 경로.
+# 호스트에서 실행 (컨테이너 밖). ISAAC_ROS_WS 는 Isaac ROS CLI가 마운트하는 경로.
 set -euo pipefail
 
 PERCEPTION_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,6 +38,12 @@ cp -f "$PERCEPTION_DIR/nodes/pose_smoother.py"           "$ASSETS/"
 # 캘리브/유틸 도구
 mkdir -p "$ASSETS/tools"
 cp -f "$PERCEPTION_DIR/tools/"*.py "$ASSETS/tools/" 2>/dev/null || true
+
+# --- 실행/launch 진입점 ----------------------------------------------------
+mkdir -p "$ASSETS/launch"
+cp -pf "$PERCEPTION_DIR"/launch/*.sh "$ASSETS/launch/"
+cp -pf "$PERCEPTION_DIR"/launch/*.py "$ASSETS/launch/"
+cp -pf "$PERCEPTION_DIR/verify_jazzy_setup.sh" "$ASSETS/"
 
 echo "[setup] 자산 배치 완료."
 echo "[setup] 다음: 컨테이너 안에서 launch/build_engines.sh 로 TensorRT 엔진(.plan) 생성"

@@ -9,7 +9,7 @@
 #       ./run_cup_pose.sh stop  으로 종료
 set -o pipefail   # set -u 는 ROS setup.bash 의 unbound 변수와 충돌하므로 쓰지 않는다
 
-ISAAC_ROS_WS="${ISAAC_ROS_WS:-/workspaces/isaac_ros-dev}"
+ISAAC_ROS_WS=/workspaces/isaac_ros-dev
 A="$ISAAC_ROS_WS/isaac_ros_assets"
 M="$A/models"
 
@@ -18,7 +18,7 @@ if [ "${1:-}" = "stop" ]; then
   echo "stopped"; exit 0
 fi
 
-source /opt/ros/humble/setup.bash
+source /opt/ros/jazzy/setup.bash
 
 # 1) RealSense + YOLO + SAM
 nohup ros2 launch isaac_ros_examples isaac_ros_examples.launch.py \

@@ -4,7 +4,7 @@
 # 모델([1,5,8400])에서 디코더가 [1,84,8400] 가정하고 out-of-bounds → SIGSEGV.
 import sys
 
-F = "/opt/ros/humble/share/isaac_ros_yolov8/launch/isaac_ros_yolov8_core.launch.py"
+F = "/opt/ros/jazzy/share/isaac_ros_yolov8/launch/isaac_ros_yolov8_core.launch.py"
 s = open(F).read()
 
 if "'num_classes': num_classes," in s:

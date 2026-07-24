@@ -1,253 +1,191 @@
-# perception 설치 가이드 — D435i + FoundationPose 라이브 컵 pose
+# perception 설치 가이드 — Isaac ROS 4.5/Jazzy
 
-새 비전 PC(예: RTX 3070)에서 이 레포를 **한 번에** 세팅하기 위한 런북.
-2026-07 s2r 구축에서 실제로 막혔던 함정과 해결을 순서대로 담았다.
-막히면 먼저 [§8 트러블슈팅](#8-트러블슈팅)을 본다.
+Ubuntu 24.04 NVIDIA GPU 호스트에 perception 환경을 구성하는 순서다. 설치와
+컨테이너 검증은 카메라 없이 끝내며, D435i는 마지막 라이브 단계에서만 연결한다.
 
-> **핵심 요약(먼저 읽기)**
-> 1. 이 스택은 NVIDIA stock 이 아니라 **커스텀 Isaac ROS 컨테이너 이미지**(FoundationPose+YOLO+SAM 3단)를 쓴다.
-> 2. 카메라는 **stock fragment realsense 를 쓰지 않는다** — 이 D435i에서 프레임 delivery 실패. **단독 realsense2_camera + 브리지**로 우회한다(`cup_pose_standalone_cam.launch.py`).
-> 3. **stock isaac_ros_yolov8 launch 는 num_classes 를 디코더에 배선하지 않는 버그**가 있어 커스텀 N-class 모델이 첫 프레임에 SIGSEGV(-11) 로 죽는다. → 기동 스크립트가 자동 패치(`patch_yolo_numclasses.py`).
-> 4. YOLO 는 **학습한 물체만** 검출한다(zero-shot 아님). 학습 대상과 실물 색/모양이 다르면 검출 0.
+## 1. 요구사항
 
----
+- `jazzy` 브랜치
+- Ubuntu 24.04 Noble x86_64
+- NVIDIA Ampere 이상 GPU
+- NVIDIA 드라이버 580 이상
+- sudo 권한과 인터넷 연결
+- Git LFS로 받은 ONNX 모델
 
-## 0. 아키텍처
+TensorRT 엔진은 GPU와 TensorRT 버전에 종속된다. 다른 머신에서 만든 `.plan`을
+재사용하지 않고 실제 실행할 GPU에서 생성한다.
 
-```
-D435i ─▶ [단독 realsense2_camera]  /camera/color/image_raw (rgb8, plain)
-              │                     /camera/aligned_depth_to_color/image_raw
-              ▼  (카메라 브리지, in-process 아님/별도 컨테이너)
-     ImageFormatConverter(rgb8) ─▶ /image_rect
-     ConvertMetric(uint16 mm→m) ─▶ /depth
-              │
-              ▼
-   YOLOv8(컵 bbox) ─▶ SAM(마스크) ─▶ sam_mask_to_mono8 ─▶ /segmentation
-              │                                              │
-              └───────────────┬──────────────────────────────┘
-                              ▼
-        FoundationPose(Cup.obj + 마스크 + depth) ─▶ /output(Detection3DArray)
-                              │
-                              ▼
-      sim2real/cup_pose_relay.py ─▶ /cup_pose ─▶ pour 정책(pour_inference)
-```
-
-- **YOLO만 학습 자산**(컵 1-class, `best.onnx`). SAM·FoundationPose 는 zero-shot.
-- 파이프라인은 크래시 없이 돌지만, **실제 pose 는 학습한 컵이 시야에 있어야** 나온다.
-
----
-
-## 1. 전제
-
-| 항목 | 값/비고 |
-|---|---|
-| 비전 PC | NVIDIA RTX GPU (3070 8GB 검증). YOLO+SAM+FP 동시 ~6.5GB |
-| OS | Ubuntu 22.04, Docker, NVIDIA Container Toolkit |
-| 드라이버 | NVIDIA 580 계열 |
-| 카메라 | Intel RealSense D435i, **USB3**, 펌웨어 **5.16.0.1**(안정) |
-| 컨테이너 이미지 | 커스텀 `isaac_ros_dev-x86_64-container` (별도 tar, ~21GB) |
-| TensorRT | 컨테이너 내 v10.3 (엔진은 GPU별 재생성) |
-
-준비물(레포 밖, 별도 전달):
-- **커스텀 컨테이너 이미지 tar** (`foundationpose_docker_image/*.tar`)
-- **best.onnx** (학습된 컵 detector) — 없으면 §7로 학습
-- 컵 CAD, SAM/FP onnx 는 레포 `models/`·`assets/` 에 포함
-
----
-
-## 2. 호스트 준비 (재부팅 전 1회)
+## 2. 호스트 부트스트랩
 
 ```bash
+git clone <repository-url>
 cd perception
-./host_setup.sh          # usbfs / rmem_max / udev / DISPLAY 안내
+git switch jazzy
+./bootstrap.sh
 ```
 
-`host_setup.sh` 가 처리/안내하는 것과 **왜 필요한지**:
+`bootstrap.sh`는 Docker, NVIDIA Container Toolkit, Git LFS, usbfs/rmem/udev
+호스트 설정을 준비하고 공식 `release-4.5` Noble APT 저장소에서
+`isaac-ros-cli`를 설치한다. Ubuntu 24.04가 아니면 중단한다.
 
-| 설정 | 안 하면 생기는 증상 |
-|---|---|
-| `usbfs_memory_mb=1000` (GRUB 영구화) | RealSense color+depth 동시 스트림서 `control_transfer EAGAIN` / `stream start failure` |
-| `net.core.rmem_max=2147483647` | cyclonedds 10MB 소켓버퍼 요구 → `rmw handle invalid` 로 **노드 생성 실패** |
-| RealSense udev rules | 컨테이너 비-root 가 USB 못 엶 (`RS2_USB_STATUS_ACCESS`) |
-| `xhost +local:` + `DISPLAY=:0` | rqt/rviz 가 이 PC 모니터에 안 뜸 |
+스크립트가 사용자를 `docker` 그룹에 추가했다면 반드시 로그아웃한 뒤 다시
+로그인한다. `newgrp`가 아닌 새 로그인 세션을 권장한다.
 
-> usbfs 영구화는 `/etc/default/grub` 수정 + `update-grub` + **재부팅**이 필요.
-
----
-
-## 3. RealSense 펌웨어 (⚠️ 반드시 호스트에서)
-
-- 권장 안정 버전 **5.16.0.1**. `rs-fw-update` 또는 realsense-viewer 로 확인/설치.
-- **컨테이너 안에서 FW 업데이트 금지**: 컨테이너 USB passthrough 가 업데이트 중 recovery PID(0adb) 를 못 잡아 카메라가 **recovery 모드**에 빠진다.
-- recovery 로 빠지면: realsense-viewer 가 "D4XX Recovery" 로 잡아 5.16.0.1 로 복구.
-
-확인:
-```bash
-docker exec -u admin <컨테이너> rs-enumerate-devices -s   # FW 버전/USB 속도
-```
-
----
-
-## 4. 컨테이너 이미지 로드 & 실행
-
-> 💡 21GB tar 를 옮기기 싫으면 **`docker/BUILD.md`** 로 `docker build` 재현 가능(권장, 레포 가벼움). 아래는 완성 tar 를 load 하는 기존 방식.
-
-
+새 로그인 셸에서 워크스페이스 변수를 명시하고 Docker/GPU preflight를 통과시킨다.
 
 ```bash
-# 1) 이미지 로드 + run_dev.sh 가 기대하는 이름으로 태그
-docker load -i /path/to/isaac_ros_dev-x86_64-container_image.tar
-docker tag <로드된 이미지>:latest isaac_ros_dev-x86_64:latest
-
-# 2) 워크스페이스 마운트 준비 (호스트) — 이미지의 /workspaces 는 비어있고 마운트 기대
-mkdir -p ~/workspaces/isaac_ros-dev
-
-# 3) 컨테이너 진입 (DISPLAY 로 GUI 확인 가능하게)
-export DISPLAY=:0                       # (로컬 모니터 세션에서 xhost +local: 선행)
-cd ~/workspaces/isaac_ros-dev/src/isaac_ros_common
-./scripts/run_dev.sh --skip_image_build -d ~/workspaces/isaac_ros-dev
-#   --skip_image_build 필수 (재빌드 방지). 컨테이너 유저 = admin(passwordless sudo).
+export ISAAC_ROS_WS="${ISAAC_ROS_WS:-$HOME/workspaces/isaac_ros-dev}"
+docker info >/dev/null
+docker run --rm --gpus all ubuntu:24.04 bash -lc 'nvidia-smi >/dev/null'
 ```
 
-이후 컨테이너 id 확인: `docker ps -q --filter ancestor=isaac_ros_dev-x86_64`
+`bootstrap.sh`도 환경을 구분하는 관리 블록을 `~/.bashrc`에 중복 없이 추가한다.
+호스트에서는 위 기본값 또는 사용자가 지정한 경로를 유지하고, CLI 컨테이너에서는
+항상 `/workspaces/isaac_ros-dev`를 사용한다. 아래 설치 명령과 같은 현재 셸에서는
+변수를 명시해 re-source 여부에 의존하지 않는다.
 
----
-
-## 5. 자산 배치 & 엔진 빌드
+## 3. Isaac ROS CLI 초기화
 
 ```bash
-# [호스트] 레포 자산 → 워크스페이스 마운트로 복사 (1회)
-cd perception && ./setup_workspace.sh
-#   models(best.onnx/SAM/FP onnx) + Cup.obj + sam_mask_to_mono8.py
-#   + yolo_interface_specs.json + launch/* 를 배치
-
-# [컨테이너] TensorRT 엔진 생성 (GPU별, 수 분) — best.plan / FP refine·score
-docker exec -u admin <컨테이너> bash -c \
-  'export ISAAC_ROS_WS=/workspaces/isaac_ros-dev; \
-   /workspaces/isaac_ros-dev/isaac_ros_assets/launch/build_engines.sh'
+sudo isaac-ros init docker
 ```
 
-> `.plan` 은 GPU·TRT 버전 종속이라 git 에 넣지 않는다(→ `.gitignore`). 환경마다 재생성.
-
----
-
-## 6. 파이프라인 실행 & 검증
+이 명령은 머신당 한 번 실행한다. 그 뒤 저장소 루트에서 Jazzy 설정과 자산을
+워크스페이스에 배치한다.
 
 ```bash
-# [컨테이너] 전체 우회 파이프라인 기동 (카메라+YOLO+bbox_depth_mask+FoundationPose+pose_overlay)
-docker exec -u admin -d <컨테이너> bash -c \
-  'export ISAAC_ROS_WS=/workspaces/isaac_ros-dev; \
-   /workspaces/isaac_ros-dev/isaac_ros_assets/launch/run_cup_pose_standalone.sh'
-
-# 약 95초 후 검증
-docker exec -u admin <컨테이너> bash -c \
-  'source /opt/ros/humble/setup.bash; \
-   /workspaces/isaac_ros-dev/isaac_ros_assets/launch/run_cup_pose_standalone.sh verify'
-
-# 종료
-docker exec -u admin <컨테이너> bash -c \
-  '/workspaces/isaac_ros-dev/isaac_ros_assets/launch/run_cup_pose_standalone.sh stop'
+export ISAAC_ROS_WS="${ISAAC_ROS_WS:-$HOME/workspaces/isaac_ros-dev}"
+./setup_jazzy.sh
+./verify_jazzy_setup.sh --host
 ```
 
-`run_cup_pose_standalone.sh` 가 자동으로 하는 것:
-0. **num_classes 패치 적용**(sudo, idempotent) — §7 참조
-1. 단독 realsense + 카메라 브리지 (fragment realsense 우회)
-2. YOLO 만 (SAM 제외 — 8GB GPU 절약), 입력 /image_rect
-2.5. detection_filter (/detections_output → cup/bottle 만 → /detections_cup)
-3. bbox_depth_mask (bbox+depth → /segmentation, SAM 대체)
-4. FoundationPose (/output = 컵 6-DOF pose)
-5. pose_overlay (/output → RGB 에 3D 축/박스 투영 → /pose_viz)
+기본 워크스페이스는 `~/workspaces/isaac_ros-dev`다. `setup_jazzy.sh`는 자식
+프로세스이므로 부모 셸의 변수를 export할 수 없다. 다른 위치를 쓸 때는 같은
+현재 셸에서 먼저 export하고 이후 모든 명령에 유지한다.
 
-**RGB 눈으로 확인**(가장 확실):
 ```bash
-# arm3070 로컬 모니터에서 xhost +local: 선행. rqt_image_view 는 PATH 에 없어 `ros2 run` 으로.
-docker exec -u admin <컨테이너> bash -c 'source /opt/ros/humble/setup.bash; \
-  DISPLAY=:0 ros2 run rqt_image_view rqt_image_view /pose_viz'   # 컵에 3D 축/박스(pose 확인)
-#   원본 RGB 만: 끝 토픽을 /camera/color/image_raw 로. /image_rect·/depth 는 NITROS 라 회색.
+export ISAAC_ROS_WS="${ISAAC_ROS_WS:-$HOME/workspaces/isaac_ros-dev}"
+export ISAAC_ROS_WS=/data/workspaces/isaac_ros-dev
+./setup_jazzy.sh
+./verify_jazzy_setup.sh --host
 ```
 
-정상 신호:
-- `/detections_output` 15~18Hz 발행 (컵 검출 시 box 포함)
-- `/pose_estimation/pose_matrix_output` 에 4x4 pose
+호스트 검증은 CLI 설정, Docker/GPU 접근, 복사된 모델과 메시를 확인하며 카메라
+장치 유무는 검사하지 않는다.
 
----
+## 4. 이미지 빌드와 컨테이너 검증
 
-## 7. ⭐ 자동 처리되는 알려진 함정 (배경 이해용)
-
-### 7.1 num_classes 미배선 → 디코더 SIGSEGV (-11)  [자동 패치됨]
-- **증상**: 카메라/bag 프레임이 흐르는 순간 컨테이너가 `-11` 로 즉사. gdb 백트레이스 = `YoloV8DecoderNode::InputCallback`.
-- **원인**: stock `isaac_ros_yolov8_core.launch.py` 가 `num_classes` 를 `YoloV8DecoderNode` 에 **전달하지 않는다**. 디코더는 하드코딩 기본 80 사용 → 1-class 모델 출력 `[1,5,8400]` 을 `[1,84,8400]` 으로 오해하고 out-of-bounds 읽음.
-- **수정**: `launch/patch_yolo_numclasses.py` (idempotent). `/opt/ros` 는 컨테이너 재생성 시 원복되므로 **`run_cup_pose_standalone.sh` 가 기동마다 sudo 로 재적용**.
-- **이식 시 주의**: 커스텀 클래스 수 YOLO 를 isaac_ros 에 올릴 때 항상 이 패치 필요. 클래스 수가 다르면 `num_classes:=N` 을 스크립트에서 맞춘다.
-
-### 7.2 fragment realsense 프레임 delivery 실패 → 단독 realsense 우회  [해결됨]
-- stock `realsense_mono_rect_depth` fragment 의 realsense(RealSenseNodeFactory)가 이 D435i에서 `/image_rect` 로 프레임을 안 보낸다(FW/IMU/QoS 무관).
-- 우회: `cup_pose_standalone_cam.launch.py` = 단독 `realsense2_camera` + `ImageFormatConverterNode(rgb8)` + `ConvertMetricNode`.
-- **주의**: 카메라 브리지와 encoder 를 억지로 한 컨테이너에 넣지 말 것. Intel realsense 는 NITROS-native 가 아니라 intra-process 로 안 붙는다. **별도 프로세스(DDS) → converter → encoder** 구조가 맞다.
-
-### 7.3 interface_specs 키 누락 → launch KeyError  [해결됨]
-- fragment realsense 를 빼면 그것이 주던 `camera_resolution`/`camera_frame`/`focal_length` spec 이 사라져 sam/yolov8 fragment 가 `'camera_resolution'` KeyError.
-- `config/yolo_interface_specs.json` 에 이 키들을 넣어 자립하게 함(이미 반영).
-
----
-
-## 8. 트러블슈팅
-
-| 증상 | 원인 / 해결 |
-|---|---|
-| 프레임 흐르면 컨테이너 `-11` 즉사 | num_classes 미배선(§7.1). 패치 적용 확인: `grep num_classes /opt/ros/humble/share/isaac_ros_yolov8/launch/isaac_ros_yolov8_core.launch.py` |
-| rqt 에서 `/image_rect` 회색 | NITROS 토픽이라 정상. RGB 는 plain `/camera/color/image_raw` 로 본다 |
-| `ros2 topic list`/`hz` 빈 결과 | daemon stale. `ros2 daemon stop` 후 `--no-daemon`. image 토픽 hz 는 sensor QoS 라 거짓음성 |
-| RealSense `control_transfer EAGAIN` | usbfs_memory_mb 기본 16MB. `echo 1000 > /sys/module/usbcore/parameters/usbfs_memory_mb` (§2) |
-| 노드 생성 시 `rmw handle invalid` | cyclonedds 소켓버퍼. `sysctl -w net.core.rmem_max=2147483647` (§2) |
-| GPU 프로세스가 안 죽음(좀비) | 컨테이너 `pkill` 로는 안 죽음(PID 네임스페이스 분리). **호스트**에서 `kill -9 $(nvidia-smi --query-compute-apps=pid --format=csv,noheader)` |
-| realsense `failed to set power state` | composable realsense 가 USB 물고 있음. 컨테이너 ROS 프로세스 전부 kill 후 재시도 |
-| 카메라 recovery 모드 | FW 를 컨테이너서 만졌기 때문(§3). realsense-viewer 로 5.16.0.1 복구 |
-| `matplotlib _ARRAY_API` numpy 충돌 | `pip install --user "matplotlib>=3.8"` |
-| 파이프라인 도는데 detection=0 | **학습한 물체가 시야에 없음/색·모양 불일치**(§9). 버그 아님 |
-| OOM/`-11` (진짜 메모리) | 좀비로 GPU 꽉 참. 위 좀비 kill 로 정리(8GB 에 YOLO+SAM+FP ~6.5GB 는 정상) |
-
----
-
-## 9. 새 물체 학습 / 컵 교체
-
-YOLO 는 **학습한 물체만** 검출한다(FoundationPose 는 pose 만 zero-shot, detection 은 아님).
-
-- 실물 컵과 학습 대상이 다르면(예: 학습=빨강, 실물=남색) 검출 0.
-- **해결 A**: 학습 대상과 같은 컵 사용.
-- **해결 B**: 새 물체 학습 —
-  ```
-  ~/yolo_train/  (ultralytics)  → 데이터셋 YOLO 포맷 → train → export imgsz640 opset16
-  → best.onnx 를 perception/models/yolov8/ 로 교체 → setup_workspace.sh → build_engines.sh
-  → run 스크립트의 num_classes 를 클래스 수에 맞춤
-  ```
-- 새 물체의 CAD 를 `assets/` 에 넣으면 FoundationPose 는 그대로 pose 추정.
-
----
-
-## 10. sim2real(pour) 연결 — 남은 작업
-
-`/output`(Detection3DArray) → `sim2real/scripts/cup_pose_relay.py` → `/cup_pose`(base 프레임) → `pour_inference.py`.
-
-아직 필요한 것(이 가이드 범위 밖):
-- **카메라 extrinsics 캘리브레이션**: `sim2real/config/global_camera_extrinsics.yaml` 이 PLACEHOLDER. hand-eye 캘리브 전엔 `/cup_pose` 가 로봇 좌표계와 안 맞는다.
-- **검출되는 컵**(§9) — pose 자체가 나와야 relay 가 의미 있음.
-- 관련: `live-pour-sim2real-plan` (pour 루프는 FK 라 grasp 캡처 순간에만 비전 필요).
-
----
-
-## 부록: 파일 맵
-
+```bash
+export ISAAC_ROS_WS="${ISAAC_ROS_WS:-$HOME/workspaces/isaac_ros-dev}"
+isaac-ros activate --build-local
 ```
-perception/
-├── host_setup.sh                     호스트 1회 세팅 (usbfs/rmem/udev)
-├── setup_workspace.sh                자산 → 워크스페이스 배치
-├── SETUP_GUIDE.md                    (이 문서)
-├── README.md                         개요
-├── models/  assets/  nodes/  config/ 자산·커스텀노드·specs
-└── launch/
-    ├── cup_pose_standalone_cam.launch.py   단독 realsense + 브리지 (fragment 우회)
-    ├── run_cup_pose_standalone.sh          전체 파이프라인 (num_classes 패치 자동)
-    ├── patch_yolo_numclasses.py            디코더 -11 수정 패치
-    └── build_engines.sh                    GPU별 .plan 생성
+
+CLI는 `realsense` 다음 `perception` 이미지 키를 적용해
+`docker/Dockerfile.perception` 레이어를 로컬 빌드한다. 컨테이너 셸이 열리면:
+
+```bash
+export ISAAC_ROS_WS=/workspaces/isaac_ros-dev
+cd "${ISAAC_ROS_WS}/isaac_ros_assets"
+./verify_jazzy_setup.sh --container
 ```
+
+컨테이너 검증은 ROS 배포판, GPU, 필수 Isaac ROS 패키지, 모델과 Cup mesh를
+확인한다. 이 단계도 D435i 없이 통과해야 한다.
+
+## 5. TensorRT 엔진 생성
+
+컨테이너 안에서 실행한다.
+
+```bash
+export ISAAC_ROS_WS=/workspaces/isaac_ros-dev
+cd "${ISAAC_ROS_WS}/isaac_ros_assets"
+./launch/build_engines.sh
+```
+
+기본 COCO 모델의 `yolov8s.plan`, 커스텀 컵 모델의 `best.plan`, FoundationPose
+엔진을 현재 GPU에서 새로 생성한다. GPU, CUDA, TensorRT 또는 컨테이너 이미지가
+바뀌면 기존 `.plan`을 지우고 다시 빌드한다.
+
+## 6. 선택 사항: D435i 연결과 라이브 실행
+
+설치·컨테이너 검증·엔진 생성을 모두 끝낸 뒤에만 D435i를 USB3 포트에 연결한다.
+카메라는 이 선택 사항인 마지막 라이브 단계에만 필요하다.
+
+### 펌웨어 제약
+
+- 검증된 펌웨어는 **5.16.0.1**이다.
+- 펌웨어 확인과 업데이트는 호스트의 RealSense 도구에서만 수행한다.
+- 컨테이너 안에서 업데이트하면 recovery PID를 놓쳐 카메라가 recovery 모드에
+  빠질 수 있다. 이 경우 호스트 `realsense-viewer`로 복구한다.
+- color+depth 스트림 오류가 나면 USB3 연결과
+  `usbfs_memory_mb=1000` 적용 여부를 먼저 확인한다.
+
+컨테이너 안에서:
+
+```bash
+export ISAAC_ROS_WS=/workspaces/isaac_ros-dev
+cd "${ISAAC_ROS_WS}/isaac_ros_assets/launch"
+./run_cup_pose_standalone.sh
+./run_cup_pose_standalone.sh verify
+./run_cup_pose_standalone.sh stop
+```
+
+라이브 화면은 로컬 디스플레이 권한을 허용한 뒤 `/pose_viz`를 연다.
+
+```bash
+DISPLAY=:0 ros2 run rqt_image_view rqt_image_view /pose_viz
+```
+
+## 7. 알려진 운영 제약
+
+### YOLO class-count 패치
+
+일부 stock YOLO launch는 `num_classes`를 decoder에 전달하지 않는다. 1-class
+모델 출력을 80-class로 해석하면 첫 프레임에서 SIGSEGV(-11)가 날 수 있다.
+`launch/patch_yolo_numclasses.py`의 idempotent 패치를 유지하고, 모델을 바꾸면
+`YOLO_NUM_CLASSES`와 필터 class ID도 함께 맞춘다. 컨테이너 이미지가 재생성되면
+`/opt/ros` 변경은 사라지므로 라이브 스크립트가 매번 패치를 확인한다.
+
+### 8 GB tracking OOM
+
+RTX 3070 8 GB에서는 FoundationPose 추정 엔진과 추적 엔진이 동시에 상주할 때
+`NVCV_ERROR_OUT_OF_MEMORY`가 발생한다. 8 GB GPU에서는 검증된
+`run_cup_pose_standalone.sh` 추정 모드와 pose smoother를 사용한다.
+tracking 모드는 충분한 VRAM이 있는 GPU에서만 사용한다.
+
+### 카메라 fragment 우회
+
+이 D435i에서는 stock fragment가 프레임을 전달하지 못했다. 라이브 경로는 독립
+`realsense2_camera` 프로세스와 RGB/depth bridge를 사용하는
+`run_cup_pose_standalone.sh`다.
+
+### GPU 프로세스 정리
+
+중단 뒤에도 GPU 메모리가 남으면 먼저 라이브 스크립트의 `stop`을 실행하고
+컨테이너 프로세스를 확인한다. 호스트의 다른 GPU 작업까지 종료할 수 있는
+무차별 `kill` 명령은 사용하지 않는다.
+
+## 8. 새 YOLO 모델
+
+YOLO는 학습한 물체만 검출한다. 새 모델을 쓸 때:
+
+1. ONNX를 `models/yolov8/`에 배치한다.
+2. `./setup_jazzy.sh`로 자산을 다시 복사한다.
+3. 대상 GPU에서 `build_engines.sh`를 다시 실행한다.
+4. 모델 클래스 수와 `YOLO_NUM_CLASSES`, 필터 class ID를 일치시킨다.
+
+FoundationPose에는 해당 물체의 CAD mesh도 필요하다.
+
+## 9. sim2real 연결
+
+`/output`에서 `/cup_pose`로 변환하려면
+`sim2real/config/global_camera_extrinsics.yaml`을 실제 장비에서 보정해야 한다.
+컵 CAD 좌표계와 simulation body 좌표계의 정합도 별도로 검증한다.
+
+## 문제 해결 순서
+
+1. 호스트: `./verify_jazzy_setup.sh --host`
+2. 컨테이너: `./verify_jazzy_setup.sh --container`
+3. TensorRT 엔진이 현재 GPU에서 생성됐는지 확인
+4. 라이브 단계에서만 USB3, 펌웨어 5.16.0.1, udev/usbfs 확인
+5. 첫 프레임 SIGSEGV면 `num_classes` 패치와 모델 출력 shape 확인

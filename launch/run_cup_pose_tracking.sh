@@ -17,7 +17,7 @@
 #       ./run_cup_pose_tracking.sh verify   확인
 set -o pipefail
 
-ISAAC_ROS_WS="${ISAAC_ROS_WS:-/workspaces/isaac_ros-dev}"
+ISAAC_ROS_WS=/workspaces/isaac_ros-dev
 A="$ISAAC_ROS_WS/isaac_ros_assets"
 M="$A/models"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +32,7 @@ MASK_DEPTH_BAND_M="${MASK_DEPTH_BAND_M:-0.06}"
 # Selector 리셋 주기(ms). 짧을수록 자주 재추정(견고/무겁), 길수록 추적 위주(가벼움).
 export TRACK_RESET_PERIOD_MS="${TRACK_RESET_PERIOD_MS:-4000}"
 
-source /opt/ros/humble/setup.bash
+source /opt/ros/jazzy/setup.bash
 
 PATCH="$HERE/patch_yolo_numclasses.py"
 if [ "${1:-}" != "stop" ] && [ "${1:-}" != "verify" ] && [ -f "$PATCH" ]; then
@@ -49,17 +49,46 @@ if [ "${1:-}" = "stop" ]; then
 fi
 
 if [ "${1:-}" = "verify" ]; then
+  verify_status=0
+  verify_probe() {
+    local success_pattern="$1"
+    local display_pattern="$2"
+    local max_lines="$3"
+    local output
+    local probe_status
+    local visible
+    shift 3
+
+    output="$("$@" 2>&1)"
+    probe_status=$?
+    visible="$(grep -E "$display_pattern" <<< "$output" | head -n "$max_lines")"
+    if [[ -n "$visible" ]]; then
+      printf '%s\n' "$visible"
+    else
+      printf '  [failed] no matching probe output\n'
+    fi
+    if [[ "$probe_status" -ne 0 ]] ||
+      ! grep -Eq "$success_pattern" <<< "$output"; then
+      verify_status=1
+    fi
+  }
+
   ros2 daemon stop >/dev/null 2>&1; sleep 1
   echo "[1] RGB /camera/color/image_raw:"
-  timeout 5 ros2 topic hz /camera/color/image_raw 2>&1 | grep -E "average|does not" | head -1
+  verify_probe 'average' 'average|does not' 1 \
+    timeout 5 ros2 topic hz /camera/color/image_raw
   echo "[2] /segmentation:"
-  timeout 6 ros2 topic hz /segmentation 2>&1 | grep -E "average|does not" | head -1
+  verify_probe 'average' 'average|does not' 1 \
+    timeout 6 ros2 topic hz /segmentation
   echo "[3] 컵 pose /output (tracking → rate 가 추정모드보다 높아야 함):"
-  timeout 8 ros2 topic hz /output 2>&1 | grep -E "average|does not" | head -1
-  timeout 8 ros2 topic echo --once /output 2>&1 | grep -E "position|z:" | head -3
+  verify_probe 'average' 'average|does not' 1 \
+    timeout 8 ros2 topic hz /output
+  verify_probe 'position|z:' 'position|z:' 3 \
+    timeout 8 ros2 topic echo --once /output
   echo "[4] /pose_viz:"
-  timeout 6 ros2 topic hz /pose_viz 2>&1 | grep -E "average|does not" | head -1
-  exit 0
+  verify_probe 'average' 'average|does not' 1 \
+    timeout 6 ros2 topic hz /pose_viz
+  exit "$verify_status"
 fi
 
 # 1) 카메라 + 브리지

@@ -1,92 +1,77 @@
-# Docker 이미지 빌드 (21GB tar 대체)
+# Isaac ROS 4.5/Jazzy 이미지 빌드
 
-기존엔 완성된 커스텀 이미지(21GB tar)를 `docker load` 했지만, 그 tar 는 **공식 재료를
-조합한 스냅샷**일 뿐이라 여기서 `docker build` 로 재현한다. 그러면 tar 를 옮길 필요가 없고
-레포에는 이 작은 텍스트 레시피만 남는다.
+이 브랜치는 공식 Isaac ROS CLI의 Docker 레이어 시스템을 사용한다. 별도 tar
+이미지나 외부 `isaac_ros_common` checkout은 필요하지 않다.
 
-## 무엇을 조합하나
-| 조각 | 출처 | 방식 |
+지원 호스트는 Ubuntu 24.04 `x86_64`, NVIDIA Ampere 이상 GPU, NVIDIA 드라이버
+580 이상이다.
+
+## 레이어 구성
+
+| 이미지 키 | 제공자 | 내용 |
 |---|---|---|
-| base(CUDA·TensorRT·ROS humble) | NVIDIA `isaac_ros_common` | 표준 layer `Dockerfile.ros2_humble` |
-| **librealsense**(SDK, 소스빌드) | Intel | 표준 layer `Dockerfile.realsense` |
-| Isaac ROS 패키지(FoundationPose/SAM/YOLOv8/examples 등) | NVIDIA isaac apt repo | `Dockerfile.perception` 가 apt install |
-| cyclonedds 설정·env(DOMAIN_ID=126 등) | 우리 | `Dockerfile.perception` |
+| CLI 기본 키 | NVIDIA Isaac ROS CLI 4.5 | Ubuntu 24.04, ROS 2 Jazzy, CUDA/TensorRT |
+| `realsense` | NVIDIA Isaac ROS CLI 4.5 | RealSense 의존성 |
+| `perception` | 이 저장소 | FoundationPose, YOLOv8, RealSense와 로컬 설정 |
 
-즉 우리 커스텀은 **`Dockerfile.perception` 레이어 하나**뿐이고, base·librealsense 는
-isaac_ros_common 의 표준 layer 가 만든다.
+`setup_jazzy.sh`가 워크스페이스 설정에 `realsense`, `perception` 순서로 키를
+등록하고, Docker 검색 경로에 이 저장소의 `docker/`와
+`/etc/isaac-ros-cli/docker`를 모두 넣는다.
 
-## 사전 준비 (호스트)
-- NVIDIA GPU + 드라이버, Docker + `nvidia-container-toolkit`, git, git-lfs.
-- `perception/host_setup.sh` 실행(usbfs·rmem_max·udev). rmem_max 는 cyclonedds 10MB 버퍼에 필수.
+## 호스트 준비
 
-## 빌드 절차
+Ubuntu 24.04에서 저장소 루트의 다음 명령을 실행한다.
+
 ```bash
-# 1) isaac_ros_common 확보 (워크스페이스 src 아래)
-mkdir -p ~/workspaces/isaac_ros-dev/src && cd ~/workspaces/isaac_ros-dev/src
-git clone https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_common.git
-
-# 2) isaac_ros_common 이 우리 Dockerfile.perception 을 찾도록 설정
-#    (isaac_ros_common 을 수정하지 않고 외부 디렉토리를 검색 경로에 추가)
-cat > ~/workspaces/isaac_ros-dev/src/isaac_ros_common/scripts/.isaac_ros_common-config <<EOF
-CONFIG_IMAGE_KEY=ros2_humble.realsense.perception
-CONFIG_DOCKER_SEARCH_DIRS=(<perception_경로>/docker)
-EOF
-#    <perception_경로> = 이 레포를 clone 한 절대경로 (예: ~/rl_ws/perception)
-
-# 3) 빌드 + 컨테이너 기동 (base → realsense → perception 체인 자동 빌드, 수십 분)
-cd ~/workspaces/isaac_ros-dev/src/isaac_ros_common
-./scripts/run_dev.sh -d ~/workspaces/isaac_ros-dev
-#    최초 실행은 --skip_image_build 없이 → 이미지 빌드. 결과 = isaac_ros_dev-x86_64:latest
-#    (이후 실행부터는 --skip_image_build 로 재사용)
-```
-빌드가 끝나면 이미지 이름이 `isaac_ros_dev-x86_64` 라서 SETUP_GUIDE/RUN.md 의 이후 단계
-(`setup_workspace.sh` → `build_engines.sh` → `run_cup_pose_standalone.sh`)가 그대로 이어진다.
-
-## 검증
-```bash
-docker exec -u admin isaac_ros_dev-x86_64-container bash -lc \
-  'which rs-enumerate-devices; ros2 pkg prefix isaac_ros_foundationpose; echo DOMAIN=$ROS_DOMAIN_ID'
-# rs-enumerate-devices(librealsense) 경로 + foundationpose 패키지 경로 + DOMAIN=126 나오면 OK
+./bootstrap.sh
+# Docker 그룹 권한 반영을 위해 로그아웃 후 다시 로그인
+export ISAAC_ROS_WS="${ISAAC_ROS_WS:-$HOME/workspaces/isaac_ros-dev}"
+docker info >/dev/null
+docker run --rm --gpus all ubuntu:24.04 bash -lc 'nvidia-smi >/dev/null'
+sudo isaac-ros init docker
+./setup_jazzy.sh
+./verify_jazzy_setup.sh --host
 ```
 
-## ⚠️ 트러블슈팅 (첫 빌드 = bring-up)
-- **isaac apt 패키지 못 찾음**: base layer 가 isaac apt repo 를 설정하는지 확인. 안 되면
-  `Dockerfile.perception` 상단에 NVIDIA isaac apt source+key 추가 필요(isaac_ros_common
-  문서 참조). 현재 이미지 = 3.2.x 버전대.
-- **버전 고정 필요**: 재현성 위해 `ros-humble-isaac-ros-foundationpose=3.2.14-0jammy` 처럼
-  버전 pin 가능(현재 이미지 버전은 CHANGELOG/메모리 참조).
-- **librealsense 버전**: `.realsense` layer 가 핀한 버전을 따른다(현재 이미지는 2.55.1).
-  특정 버전이 필요하면 `Dockerfile.realsense` 의 ARG 확인.
-- 빌드가 안 되면 기존 방식(21GB tar `docker load`)으로 폴백 가능 — SETUP_GUIDE §4.
+`bootstrap.sh`는 공식
+`https://isaac.download.nvidia.com/isaac-ros/release-4.5 noble main`
+APT source를 idempotent하게 등록하고 `isaac-ros-cli`를 설치한다.
 
-## 참고 — 왜 tar 대신 이걸 쓰나
-- 레포가 작게 유지됨(이 레시피는 수 KB). tar 전송(21GB) 불필요.
-- 재료가 전부 공식이라 어느 머신에서든 `git clone` → build 로 재현.
-- 단점: 첫 빌드에 시간(수십 분)과 네트워크 필요. 급하면 tar `docker load` 가 빠름.
+## 빌드
 
----
+```bash
+export ISAAC_ROS_WS="${ISAAC_ROS_WS:-$HOME/workspaces/isaac_ros-dev}"
+isaac-ros activate --build-local
+```
 
-## Blackwell(RTX 50/PRO 6000) 대응 — 목표: Isaac ROS release-4.5
+CLI가 `Dockerfile.perception`을 찾아 기본 이미지 위에 로컬 레이어를 만든다.
+레이어 변경이 없을 때는 다음부터 `isaac-ros activate`로 재사용할 수 있다.
 
-**배경**: 전 머신이 Blackwell(5080·5090·server 6000)로 가는데, 현재 이미지(Isaac ROS **3.2**,
-Ubuntu 22.04, CUDA 12.x)는 Blackwell(sm_120)을 지원 안 한다. Blackwell 지원은 **release-4.5**부터.
+## 컨테이너 검증과 엔진
 
-**release-4.5 요구사항** (nvidia-isaac-ros.github.io/getting_started):
-| 항목 | 3.2 (현재) | 4.5 (Blackwell) |
-|---|---|---|
-| CUDA | 12.x | **13.0+** |
-| TensorRT | ~8.x | 10.13 |
-| 드라이버 | — | **580+** (pc5090=580.159 ✅) |
-| OS | 22.04 | **24.04** |
-| ROS | **Humble** | **Jazzy** |
+활성화된 컨테이너 안에서:
 
-**즉 base 태그 교체가 아니라 major 마이그레이션**:
-- `isaac_ros_common` → release-4.5 브랜치, run_dev.sh 로 CUDA13/Ubuntu24.04 base 빌드.
-- `Dockerfile.perception` 의 `ros-humble-isaac-ros-*` → **`ros-jazzy-isaac-ros-*`** (4.5 버전).
-- launch fragment·FoundationPose 노드 파라미터·**num_classes 패치**를 4.5 API 로 재검증.
-- 엔진(.plan) TensorRT 10.13 으로 재빌드(build_engines.sh, GPU별).
-- 커스텀 rclpy 노드(bbox_depth_mask·pose_overlay·pose_smoother·detection_filter)는 대부분 포팅되나 Jazzy 확인 필요.
+```bash
+export ISAAC_ROS_WS=/workspaces/isaac_ros-dev
+cd "${ISAAC_ROS_WS}/isaac_ros_assets"
+./verify_jazzy_setup.sh --container
+./launch/build_engines.sh
+```
 
-**전략**: 4.5/Jazzy 로 레시피를 한 번 맞추면 → 전 Blackwell 머신 동일 이미지 재현(환경별 충돌 최소화).
-**검증**: 5090 이 지금 있으니, 3070→5080 교체 전에 5090 에서 4.5 build+run 을 통과시켜 두면 됨.
-**주의**: 마이그레이션은 미착수. 위 3.2 레시피는 Ampere(3070) 용으로 계속 유효.
+검증은 카메라를 요구하지 않는다. 빌더는 기본 `yolov8s.plan`과 커스텀
+`best.plan`을 모두 생성한다. TensorRT 엔진은 GPU/드라이버/CUDA/TensorRT 조합에
+종속되므로 대상 머신에서 생성하고 이미지가 바뀌면 다시 빌드한다.
+
+## 문제 해결
+
+- `isaac-ros`를 찾지 못하면 host APT source와 `isaac-ros-cli` 설치를 확인한다.
+- `perception` 레이어를 찾지 못하면
+  `${ISAAC_ROS_WS}/scripts/.isaac_ros_common-config`에 저장소의 절대
+  `docker/` 경로와 `/etc/isaac-ros-cli/docker`가 모두 있는지 확인한다.
+- 이미지 키 순서는 `realsense` 다음 `perception`이어야 한다.
+- 패키지를 찾지 못하면 `Dockerfile.perception`이 `ros-jazzy-*` 패키지를
+  사용하고 공식 release-4.5 source가 컨테이너에 있는지 확인한다.
+- 커스텀 YOLO 모델은 `num_classes` 패치와 실행 설정의 클래스 수가 일치해야 한다.
+- 8 GB GPU에서는 tracking 엔진 동시 상주가 OOM을 일으킬 수 있으므로
+  standalone 추정 모드를 사용한다.
+- D435i 펌웨어 5.16.0.1 확인과 업데이트는 호스트에서만 수행한다.

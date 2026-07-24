@@ -15,7 +15,7 @@
 #       ./run_cup_pose_standalone.sh verify   각 단계 프레임/검출/pose 확인
 set -o pipefail   # set -u 는 ROS setup.bash 의 unbound 변수와 충돌하므로 쓰지 않는다
 
-ISAAC_ROS_WS="${ISAAC_ROS_WS:-/workspaces/isaac_ros-dev}"
+ISAAC_ROS_WS=/workspaces/isaac_ros-dev
 A="$ISAAC_ROS_WS/isaac_ros_assets"
 M="$A/models"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,7 +36,7 @@ MASK_DEPTH_BAND_M="${MASK_DEPTH_BAND_M:-0.06}"
 SMOOTH="${SMOOTH:-1}"
 SMOOTH_ALPHA="${SMOOTH_ALPHA:-0.3}"
 
-source /opt/ros/humble/setup.bash
+source /opt/ros/jazzy/setup.bash
 
 # 0) isaac_ros_yolov8 launch 에 num_classes 배선 패치 (idempotent, 매 기동 시 적용).
 #    stock launch 는 num_classes 를 YoloV8DecoderNode 에 전달하지 않아 디코더가
@@ -60,22 +60,53 @@ fi
 if [ "${1:-}" = "verify" ]; then
   # NITROS 토픽(/image_rect,/depth)은 echo/hz 거짓음성 → plain 토픽·검출 결과로 판별.
   # ros2 CLI 는 daemon staleness 로 "not published" 오탐이 잦다 → 먼저 daemon stop.
+  verify_status=0
+  verify_probe() {
+    local success_pattern="$1"
+    local display_pattern="$2"
+    local max_lines="$3"
+    local output
+    local probe_status
+    local visible
+    shift 3
+
+    output="$("$@" 2>&1)"
+    probe_status=$?
+    visible="$(grep -E "$display_pattern" <<< "$output" | head -n "$max_lines")"
+    if [[ -n "$visible" ]]; then
+      printf '%s\n' "$visible"
+    else
+      printf '  [failed] no matching probe output\n'
+    fi
+    if [[ "$probe_status" -ne 0 ]] ||
+      ! grep -Eq "$success_pattern" <<< "$output"; then
+      verify_status=1
+    fi
+  }
+
   ros2 daemon stop >/dev/null 2>&1; sleep 1
   echo "[1] RGB 원본 (plain, 신뢰) /camera/color/image_raw:"
-  timeout 5 ros2 topic hz /camera/color/image_raw 2>&1 | grep -E "average|does not" | head -1
+  verify_probe 'average' 'average|does not' 1 \
+    timeout 5 ros2 topic hz /camera/color/image_raw
   echo "[2] aligned depth /camera/aligned_depth_to_color/image_raw:"
-  timeout 5 ros2 topic hz /camera/aligned_depth_to_color/image_raw 2>&1 | grep -E "average|does not" | head -1
+  verify_probe 'average' 'average|does not' 1 \
+    timeout 5 ros2 topic hz /camera/aligned_depth_to_color/image_raw
   echo "[3] YOLO 검출 /detections_output (컵을 카메라 30cm 정면에 두고):"
-  timeout 8 ros2 topic echo --once /detections_output 2>&1 | grep -E "class_id|score" | head -4
+  verify_probe 'class_id|score' 'class_id|score' 4 \
+    timeout 8 ros2 topic echo --once /detections_output
   echo "[3b] 필터 후 컵 검출 /detections_cup (cup/bottle 만):"
-  timeout 8 ros2 topic echo --once /detections_cup 2>&1 | grep -E "class_id|size_x" | head -4
+  verify_probe 'class_id|size_x' 'class_id|size_x' 4 \
+    timeout 8 ros2 topic echo --once /detections_cup
   echo "[4] depth 마스크 /segmentation (mono8):"
-  timeout 6 ros2 topic hz /segmentation 2>&1 | grep -E "average|does not" | head -1
+  verify_probe 'average' 'average|does not' 1 \
+    timeout 6 ros2 topic hz /segmentation
   echo "[5] 컵 pose /output (position=컵 위치[m], z=카메라앞 거리):"
-  timeout 10 ros2 topic echo --once /output 2>&1 | grep -E "position|z:" | head -4
+  verify_probe 'position|z:' 'position|z:' 4 \
+    timeout 10 ros2 topic echo --once /output
   echo "[6] pose 오버레이 /pose_viz (rqt_image_view 로 축/박스 확인):"
-  timeout 8 ros2 topic hz /pose_viz 2>&1 | grep -E "average|does not" | head -1
-  exit 0
+  verify_probe 'average' 'average|does not' 1 \
+    timeout 8 ros2 topic hz /pose_viz
+  exit "$verify_status"
 fi
 
 # 1) standalone realsense + 카메라 브리지 (fragment realsense 대체)
